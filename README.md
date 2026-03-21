@@ -86,6 +86,13 @@ The mapper recognises these ICS fields:
 | Reminder | Minutes before event | `15`, `60`, `1440` |
 | Recurrence | Repeat rule | `Daily`, `Weekly`, `Monthly`, `Yearly` |
 
+## Excel Templates
+
+Two Excel files are included to help you get started:
+
+- **CSV2ICS_Template.xlsx** — A blank template with all 14 supported column headers pre-configured, auto-filters, and a **Notes** sheet explaining each column with accepted values and examples. Save the Events sheet as CSV to use with the app.
+- **CSV2ICS_Sample.xlsx** — The same template populated with 15 sample events demonstrating timed events, all-day events, multi-day spans, recurrence patterns (daily, weekly, fortnightly, monthly, yearly), various reminder durations, priorities, statuses, UK locations, and both DD/MM/YYYY and YYYY-MM-DD date formats.
+
 ## Author
 
 **Simon Craig**
