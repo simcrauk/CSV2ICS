@@ -56,3 +56,5 @@ Test Data/
 
 # Claude Code local data
 .claude/
+/.claude
+.claude/settings.local.json
