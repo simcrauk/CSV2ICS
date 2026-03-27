@@ -85,6 +85,7 @@ language='*'\"")
 #define IDC_COMBO_REQATTEND  1121
 #define IDC_COMBO_OPTATTEND  1122
 #define IDC_COMBO_DURATION   1123
+#define IDC_COMBO_TIMEZONE   1124
 #define IDC_PREVIEW         1130
 
 /* Page 3 - Export */
@@ -110,7 +111,7 @@ enum {
     ICS_START_TIME, ICS_END_TIME, ICS_ALL_DAY, ICS_REMINDER, ICS_RECURRENCE,
     ICS_RECUR_END, ICS_RECUR_COUNT, ICS_RECUR_INTERVAL,
     ICS_CLASS, ICS_ORGANIZER, ICS_REQ_ATTENDEES, ICS_OPT_ATTENDEES,
-    ICS_DURATION,
+    ICS_DURATION, ICS_TIMEZONE,
     ICS_FIELD_COUNT
 };
 
@@ -121,7 +122,7 @@ static const wchar_t* ICS_FIELD_NAMES[] = {
     L"Start Time", L"End Time", L"All Day", L"Reminder", L"Recurrence",
     L"Recur End Date", L"Recur Count", L"Recur Interval",
     L"Classification", L"Organizer", L"Req. Attendees", L"Opt. Attendees",
-    L"Duration"
+    L"Duration", L"Timezone"
 };
 
 static const int COMBO_IDS[] = {
@@ -131,7 +132,7 @@ static const int COMBO_IDS[] = {
     IDC_COMBO_STARTTIME, IDC_COMBO_ENDTIME, IDC_COMBO_ALLDAY, IDC_COMBO_REMINDER,
     IDC_COMBO_RECURRENCE, IDC_COMBO_RECUREND, IDC_COMBO_RECURCOUNT, IDC_COMBO_RECURINTV,
     IDC_COMBO_CLASS, IDC_COMBO_ORGANIZER, IDC_COMBO_REQATTEND, IDC_COMBO_OPTATTEND,
-    IDC_COMBO_DURATION
+    IDC_COMBO_DURATION, IDC_COMBO_TIMEZONE
 };
 
 /* Reminder duration options (in minutes), -1 = none */
@@ -1007,11 +1008,30 @@ static bool IcsWriteEvent(FILE* f, CsvRow* row, AppState* state, int eventIndex)
     fprintf(f, "DTSTAMP:%04d%02d%02dT%02d%02d%02dZ\r\n",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 
+    /* Per-event timezone */
+    const wchar_t* tzStr = GetField(row, mapping, ICS_TIMEZONE);
+    char* tzUtf8 = NULL;
+    if (tzStr && *tzStr) {
+        tzUtf8 = WideToUtf8(tzStr);
+        /* Trim whitespace */
+        if (tzUtf8) {
+            char* p = tzUtf8;
+            while (*p == ' ') p++;
+            if (p != tzUtf8) memmove(tzUtf8, p, strlen(p) + 1);
+            int tlen = (int)strlen(tzUtf8);
+            while (tlen > 0 && tzUtf8[tlen-1] == ' ') tzUtf8[--tlen] = '\0';
+            if (tzUtf8[0] == '\0') { free(tzUtf8); tzUtf8 = NULL; }
+        }
+    }
+
     /* DTSTART */
     char dtBuf[64];
     IcsFormatDateTime(&dtStart, dtBuf, sizeof(dtBuf));
     if (dtStart.has_time) {
-        fprintf(f, "DTSTART:%s\r\n", dtBuf);
+        if (tzUtf8)
+            fprintf(f, "DTSTART;TZID=%s:%s\r\n", tzUtf8, dtBuf);
+        else
+            fprintf(f, "DTSTART:%s\r\n", dtBuf);
     } else {
         fprintf(f, "DTSTART;VALUE=DATE:%s\r\n", dtBuf);
     }
@@ -1063,7 +1083,10 @@ static bool IcsWriteEvent(FILE* f, CsvRow* row, AppState* state, int eventIndex)
 
             IcsFormatDateTime(&dtEnd, dtBuf, sizeof(dtBuf));
             if (dtEnd.has_time) {
-                fprintf(f, "DTEND:%s\r\n", dtBuf);
+                if (tzUtf8)
+                    fprintf(f, "DTEND;TZID=%s:%s\r\n", tzUtf8, dtBuf);
+                else
+                    fprintf(f, "DTEND:%s\r\n", dtBuf);
             } else {
                 fprintf(f, "DTEND;VALUE=DATE:%s\r\n", dtBuf);
             }
@@ -1264,7 +1287,37 @@ static bool IcsWriteEvent(FILE* f, CsvRow* row, AppState* state, int eventIndex)
         IcsWriteValarm(f, REMINDER_VALUES[state->defaultReminder2]);
     }
 
+    /* Custom X-properties: any CSV column whose header starts with "X-" and is not
+       explicitly mapped to a field gets written as an extension property */
+    if (state->csv.has_header) {
+        for (int c = 0; c < state->csv.col_count; c++) {
+            const wchar_t* hdr = state->csv.header.fields[c];
+            if (!hdr || (hdr[0] != L'X' && hdr[0] != L'x') || hdr[1] != L'-') continue;
+
+            /* Skip if this column is already mapped to a known field */
+            bool isMapped = false;
+            for (int fi = 0; fi < ICS_FIELD_COUNT; fi++) {
+                if (mapping[fi] == c) { isMapped = true; break; }
+            }
+            if (isMapped) continue;
+
+            /* Get value from this row */
+            if (c < row->field_count && row->fields[c] && row->fields[c][0]) {
+                char* propName = WideToUtf8(hdr);
+                if (propName) {
+                    /* Uppercase the property name */
+                    for (char* p = propName; *p; p++) {
+                        if (*p >= 'a' && *p <= 'z') *p -= 32;
+                    }
+                    IcsWriteProperty(f, propName, row->fields[c]);
+                    free(propName);
+                }
+            }
+        }
+    }
+
     fprintf(f, "END:VEVENT\r\n");
+    free(tzUtf8);
     return true;
 }
 
@@ -1734,6 +1787,7 @@ static void AutoMapFields(AppState* state) {
         { ICS_REQ_ATTENDEES,  { L"required attendees", L"attendees", L"req attendees", L"invitees", NULL } },
         { ICS_OPT_ATTENDEES,  { L"optional attendees", L"opt attendees", NULL } },
         { ICS_DURATION,       { L"duration", L"length", NULL } },
+        { ICS_TIMEZONE,       { L"timezone", L"time zone", L"tz", L"tzid", NULL } },
     };
 
     for (int m = 0; m < (int)(sizeof(autoMap) / sizeof(autoMap[0])); m++) {
@@ -1795,12 +1849,17 @@ static void UpdateIcsPreview(AppState* state) {
             }
             if (forceAllDay) dt.has_time = false;
 
-            wchar_t line[128];
+            wchar_t line[256];
+            const wchar_t* tz = GetField(row, mapping, ICS_TIMEZONE);
             if (dt.has_time) {
-                swprintf(line, 128, L"DTSTART:%04d%02d%02dT%02d%02d%02d\r\n",
-                         dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+                if (tz && *tz)
+                    swprintf(line, 256, L"DTSTART;TZID=%s:%04d%02d%02dT%02d%02d%02d\r\n",
+                             tz, dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+                else
+                    swprintf(line, 256, L"DTSTART:%04d%02d%02dT%02d%02d%02d\r\n",
+                             dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
             } else {
-                swprintf(line, 128, L"DTSTART;VALUE=DATE:%04d%02d%02d\r\n",
+                swprintf(line, 256, L"DTSTART;VALUE=DATE:%04d%02d%02d\r\n",
                          dt.year, dt.month, dt.day);
             }
             wcscat(preview, line);
@@ -2073,7 +2132,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_SYSCOMMAND:
         if (wParam == IDM_ABOUT) {
             MessageBox(hwnd,
-                L"CSV to ICS Converter v1.1\r\n\r\n"
+                L"CSV to ICS Converter v1.2\r\n\r\n"
                 L"Author: Simon Craig\r\n"
                 L"Code: Entirely generated by Claude (Anthropic)\r\n\r\n"
                 L"Converts CSV/TSV files to RFC 5545 compliant\r\n"
@@ -2086,6 +2145,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 L"  \x2022  Attendees and Organizer\r\n"
                 L"  \x2022  Duration, Classification, Recurrence\r\n"
                 L"  \x2022  Reminders (VALARM)\r\n"
+                L"  \x2022  Per-event timezones\r\n"
+                L"  \x2022  Custom X-properties\r\n"
                 L"  \x2022  Outlook and Apple Calendar support\r\n\r\n"
                 L"No external dependencies. Single executable\r\n"
                 L"built with the Windows SDK and pure C.",
