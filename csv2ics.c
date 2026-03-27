@@ -57,7 +57,7 @@ language='*'\"")
 #define IDC_RADIO_MDY       1004
 #define IDC_RADIO_DMY       1005
 #define IDC_RADIO_ISO       1006
-#define IDC_LISTVIEW        1006
+#define IDC_LISTVIEW        1007
 #define IDC_BTN_NEXT        1010
 #define IDC_BTN_BACK        1011
 
@@ -77,7 +77,15 @@ language='*'\"")
 #define IDC_COMBO_ALLDAY    1112
 #define IDC_COMBO_REMINDER  1113
 #define IDC_COMBO_RECURRENCE 1114
-#define IDC_PREVIEW         1120
+#define IDC_COMBO_RECUREND   1115
+#define IDC_COMBO_RECURCOUNT 1116
+#define IDC_COMBO_RECURINTV  1117
+#define IDC_COMBO_CLASS      1118
+#define IDC_COMBO_ORGANIZER  1119
+#define IDC_COMBO_REQATTEND  1121
+#define IDC_COMBO_OPTATTEND  1122
+#define IDC_COMBO_DURATION   1123
+#define IDC_PREVIEW         1130
 
 /* Page 3 - Export */
 #define IDC_RADIO_SINGLE    1200
@@ -100,6 +108,9 @@ enum {
     ICS_LOCATION, ICS_URL, ICS_CATEGORIES, ICS_STATUS,
     ICS_TRANSP, ICS_PRIORITY,
     ICS_START_TIME, ICS_END_TIME, ICS_ALL_DAY, ICS_REMINDER, ICS_RECURRENCE,
+    ICS_RECUR_END, ICS_RECUR_COUNT, ICS_RECUR_INTERVAL,
+    ICS_CLASS, ICS_ORGANIZER, ICS_REQ_ATTENDEES, ICS_OPT_ATTENDEES,
+    ICS_DURATION,
     ICS_FIELD_COUNT
 };
 
@@ -107,7 +118,10 @@ static const wchar_t* ICS_FIELD_NAMES[] = {
     L"Start Date (required)", L"End Date", L"SUMMARY", L"DESCRIPTION",
     L"LOCATION", L"URL", L"CATEGORIES", L"STATUS",
     L"TRANSP", L"PRIORITY",
-    L"Start Time", L"End Time", L"All Day", L"Reminder", L"Recurrence"
+    L"Start Time", L"End Time", L"All Day", L"Reminder", L"Recurrence",
+    L"Recur End Date", L"Recur Count", L"Recur Interval",
+    L"Classification", L"Organizer", L"Req. Attendees", L"Opt. Attendees",
+    L"Duration"
 };
 
 static const int COMBO_IDS[] = {
@@ -115,7 +129,9 @@ static const int COMBO_IDS[] = {
     IDC_COMBO_LOCATION, IDC_COMBO_URL, IDC_COMBO_CATEGORIES, IDC_COMBO_STATUS,
     IDC_COMBO_TRANSP, IDC_COMBO_PRIORITY,
     IDC_COMBO_STARTTIME, IDC_COMBO_ENDTIME, IDC_COMBO_ALLDAY, IDC_COMBO_REMINDER,
-    IDC_COMBO_RECURRENCE
+    IDC_COMBO_RECURRENCE, IDC_COMBO_RECUREND, IDC_COMBO_RECURCOUNT, IDC_COMBO_RECURINTV,
+    IDC_COMBO_CLASS, IDC_COMBO_ORGANIZER, IDC_COMBO_REQATTEND, IDC_COMBO_OPTATTEND,
+    IDC_COMBO_DURATION
 };
 
 /* Reminder duration options (in minutes), -1 = none */
@@ -153,6 +169,7 @@ typedef struct {
     int      row_count;
     int      col_count;
     bool     has_header;
+    wchar_t  delimiter; /* L',' for CSV, L'\t' for TSV */
 } CsvData;
 
 typedef struct {
@@ -205,7 +222,7 @@ static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
 /* CSV */
 static bool     CsvLoad(AppState* state, const wchar_t* filePath);
-static int      CsvParseRow(const wchar_t* data, int* pos, int dataLen, wchar_t** fields, int maxFields);
+static int      CsvParseRow(const wchar_t* data, int* pos, int dataLen, wchar_t** fields, int maxFields, wchar_t delim);
 static bool     CsvDetectHeader(CsvData* csv);
 static void     CsvFree(CsvData* csv);
 
@@ -217,7 +234,8 @@ static void     IcsEscapeText(const wchar_t* input, wchar_t* output, int outLen)
 static void     IcsWriteFolded(FILE* f, const char* line);
 static void     NextDay(ParsedDateTime* dt);
 static int      ParseReminderMinutes(const wchar_t* input);
-static const char* ParseRecurrence(const wchar_t* input);
+static const char* ParseRecurrenceFreq(const wchar_t* input);
+static int      ParseDurationMinutes(const wchar_t* input);
 static bool     IcsWriteEvent(FILE* f, CsvRow* row, AppState* state, int eventIndex);
 static bool     IcsExportSingle(const wchar_t* path, AppState* state);
 static bool     IcsExportSeparate(const wchar_t* folder, AppState* state);
@@ -297,7 +315,18 @@ static bool CsvLoad(AppState* state, const wchar_t* filePath) {
     free(rawData);
 
 parse:;
-    /* Parse CSV rows */
+    /* Auto-detect delimiter: count tabs vs commas in first line */
+    {
+        int commas = 0, tabs = 0;
+        for (int i = 0; i < wideLen && wideData[i] != L'\r' && wideData[i] != L'\n'; i++) {
+            if (wideData[i] == L',') commas++;
+            else if (wideData[i] == L'\t') tabs++;
+        }
+        state->csv.delimiter = (tabs > commas) ? L'\t' : L',';
+    }
+    wchar_t delim = state->csv.delimiter;
+
+    /* Parse CSV/TSV rows */
     state->csv.rows = (CsvRow*)calloc(MAX_ROWS, sizeof(CsvRow));
     if (!state->csv.rows) { free(wideData); return false; }
 
@@ -306,7 +335,7 @@ parse:;
     wchar_t* fields[MAX_COLUMNS];
 
     /* Parse first row (potential header) */
-    int firstRowCols = CsvParseRow(wideData, &pos, wideLen, fields, MAX_COLUMNS);
+    int firstRowCols = CsvParseRow(wideData, &pos, wideLen, fields, MAX_COLUMNS, delim);
     if (firstRowCols <= 0) { free(wideData); return false; }
 
     state->csv.col_count = firstRowCols;
@@ -317,7 +346,7 @@ parse:;
 
     /* Parse remaining rows */
     while (pos < wideLen && rowCount < MAX_ROWS) {
-        int cols = CsvParseRow(wideData, &pos, wideLen, fields, MAX_COLUMNS);
+        int cols = CsvParseRow(wideData, &pos, wideLen, fields, MAX_COLUMNS, delim);
         if (cols <= 0) break;
 
         CsvRow* row = &state->csv.rows[rowCount];
@@ -335,7 +364,7 @@ parse:;
     return true;
 }
 
-static int CsvParseRow(const wchar_t* data, int* pos, int dataLen, wchar_t** fields, int maxFields) {
+static int CsvParseRow(const wchar_t* data, int* pos, int dataLen, wchar_t** fields, int maxFields, wchar_t delim) {
     int fieldCount = 0;
     wchar_t buf[MAX_FIELD_LEN];
     int bufPos = 0;
@@ -359,7 +388,7 @@ static int CsvParseRow(const wchar_t* data, int* pos, int dataLen, wchar_t** fie
             if (ch == L'"') {
                 parseState = IN_QUOTED;
                 (*pos)++;
-            } else if (ch == L',' ) {
+            } else if (ch == delim) {
                 buf[0] = L'\0';
                 fields[fieldCount++] = WstrDup(buf);
                 (*pos)++;
@@ -379,10 +408,10 @@ static int CsvParseRow(const wchar_t* data, int* pos, int dataLen, wchar_t** fie
             break;
 
         case IN_UNQUOTED:
-            if (ch == L',' || ch == L'\r' || ch == L'\n' || ch == L'\0') {
+            if (ch == delim || ch == L'\r' || ch == L'\n' || ch == L'\0') {
                 buf[bufPos] = L'\0';
                 fields[fieldCount++] = WstrDup(buf);
-                if (ch == L',') {
+                if (ch == delim) {
                     parseState = FIELD_START;
                     (*pos)++;
                 } else {
@@ -422,7 +451,7 @@ static int CsvParseRow(const wchar_t* data, int* pos, int dataLen, wchar_t** fie
         case QUOTE_END:
             buf[bufPos] = L'\0';
             fields[fieldCount++] = WstrDup(buf);
-            if (ch == L',') {
+            if (ch == delim) {
                 parseState = FIELD_START;
                 (*pos)++;
             } else {
@@ -826,8 +855,8 @@ static int ParseReminderMinutes(const wchar_t* input) {
     return val;
 }
 
-/* Parse a recurrence string. Returns RRULE value or NULL if not recognized */
-static const char* ParseRecurrence(const wchar_t* input) {
+/* Parse a recurrence string. Returns FREQ= base or NULL if not recognized */
+static const char* ParseRecurrenceFreq(const wchar_t* input) {
     if (!input || !*input) return NULL;
 
     wchar_t lower[128];
@@ -836,13 +865,42 @@ static const char* ParseRecurrence(const wchar_t* input) {
     lower[len < 127 ? len : 127] = L'\0';
 
     if (wcsstr(lower, L"daily") || wcsstr(lower, L"every day")) return "FREQ=DAILY";
+    if (wcsstr(lower, L"fortnigh") || wcsstr(lower, L"bi-week") || wcsstr(lower, L"biweek")) return "FREQ=WEEKLY;INTERVAL=2";
     if (wcsstr(lower, L"weekly") || wcsstr(lower, L"every week")) return "FREQ=WEEKLY";
     if (wcsstr(lower, L"monthly") || wcsstr(lower, L"every month")) return "FREQ=MONTHLY";
     if (wcsstr(lower, L"yearly") || wcsstr(lower, L"annual") || wcsstr(lower, L"every year")) return "FREQ=YEARLY";
     if (wcsstr(lower, L"weekday") || wcsstr(lower, L"work")) return "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR";
-    if (wcsstr(lower, L"fortnigh") || wcsstr(lower, L"bi-week") || wcsstr(lower, L"biweek")) return "FREQ=WEEKLY;INTERVAL=2";
 
     return NULL;
+}
+
+/* Parse a duration string like "2 hours", "30 minutes", "1.5 hours", "90 min". Returns minutes, or -1 */
+static int ParseDurationMinutes(const wchar_t* input) {
+    if (!input || !*input) return -1;
+
+    const wchar_t* p = input;
+    while (*p == L' ') p++;
+    if (!iswdigit(*p)) return -1;
+
+    double val = 0;
+    while (iswdigit(*p)) { val = val * 10 + (*p - L'0'); p++; }
+    if (*p == L'.') {
+        p++;
+        double frac = 0.1;
+        while (iswdigit(*p)) { val += (*p - L'0') * frac; frac *= 0.1; p++; }
+    }
+    while (*p == L' ') p++;
+
+    wchar_t lower[64];
+    int ulen = (int)wcslen(p);
+    for (int i = 0; i < ulen && i < 63; i++) lower[i] = towlower(p[i]);
+    lower[ulen < 63 ? ulen : 63] = L'\0';
+
+    if (wcsstr(lower, L"hour") || wcsstr(lower, L"hr")) return (int)(val * 60);
+    if (wcsstr(lower, L"day")) return (int)(val * 1440);
+    if (wcsstr(lower, L"week")) return (int)(val * 10080);
+    /* Default: assume minutes */
+    return (int)val;
 }
 
 static bool IsBoolTrue(const wchar_t* input) {
@@ -958,55 +1016,68 @@ static bool IcsWriteEvent(FILE* f, CsvRow* row, AppState* state, int eventIndex)
         fprintf(f, "DTSTART;VALUE=DATE:%s\r\n", dtBuf);
     }
 
-    /* DTEND */
+    /* DTEND or DURATION */
     {
-        ParsedDateTime dtEnd = {0};
-        bool hasEnd = false;
-
         const wchar_t* dtEndStr = GetField(row, mapping, ICS_DTEND);
-        if (dtEndStr && *dtEndStr) {
-            dtEnd = ParseDateTime(dtEndStr, datePref);
-            hasEnd = dtEnd.valid;
-        }
+        const wchar_t* durStr = GetField(row, mapping, ICS_DURATION);
+        bool hasExplicitEnd = dtEndStr && *dtEndStr;
+        bool hasDuration = durStr && *durStr && !forceAllDay;
 
-        /* Combine separate end time column */
-        if (hasEnd && !forceAllDay) {
-            const wchar_t* endTimeStr = GetField(row, mapping, ICS_END_TIME);
-            if (endTimeStr && *endTimeStr) {
-                int h, m, s;
-                if (TryParseTime(endTimeStr, &h, &m, &s)) {
-                    dtEnd.hour = h; dtEnd.minute = m; dtEnd.second = s;
-                    dtEnd.has_time = true;
+        if (hasExplicitEnd || !hasDuration) {
+            /* Write DTEND */
+            ParsedDateTime dtEnd = {0};
+            bool hasEnd = false;
+
+            if (hasExplicitEnd) {
+                dtEnd = ParseDateTime(dtEndStr, datePref);
+                hasEnd = dtEnd.valid;
+            }
+
+            if (hasEnd && !forceAllDay) {
+                const wchar_t* endTimeStr = GetField(row, mapping, ICS_END_TIME);
+                if (endTimeStr && *endTimeStr) {
+                    int h, m, s;
+                    if (TryParseTime(endTimeStr, &h, &m, &s)) {
+                        dtEnd.hour = h; dtEnd.minute = m; dtEnd.second = s;
+                        dtEnd.has_time = true;
+                    }
                 }
             }
-        }
 
-        if (!hasEnd) {
-            dtEnd = dtStart;
-            hasEnd = true;
-        }
-
-        if (forceAllDay) {
-            dtEnd.has_time = false;
-        }
-
-        /* For all-day events (VALUE=DATE), DTEND is exclusive per RFC 5545.
-           If DTEND <= DTSTART, set DTEND to DTSTART + 1 day. */
-        if (!dtEnd.has_time) {
-            if (dtEnd.year < dtStart.year ||
-                (dtEnd.year == dtStart.year && dtEnd.month < dtStart.month) ||
-                (dtEnd.year == dtStart.year && dtEnd.month == dtStart.month && dtEnd.day <= dtStart.day)) {
+            if (!hasEnd) {
                 dtEnd = dtStart;
-                dtEnd.has_time = false;
-                NextDay(&dtEnd);
+                hasEnd = true;
             }
-        }
 
-        IcsFormatDateTime(&dtEnd, dtBuf, sizeof(dtBuf));
-        if (dtEnd.has_time) {
-            fprintf(f, "DTEND:%s\r\n", dtBuf);
+            if (forceAllDay) dtEnd.has_time = false;
+
+            if (!dtEnd.has_time) {
+                if (dtEnd.year < dtStart.year ||
+                    (dtEnd.year == dtStart.year && dtEnd.month < dtStart.month) ||
+                    (dtEnd.year == dtStart.year && dtEnd.month == dtStart.month && dtEnd.day <= dtStart.day)) {
+                    dtEnd = dtStart;
+                    dtEnd.has_time = false;
+                    NextDay(&dtEnd);
+                }
+            }
+
+            IcsFormatDateTime(&dtEnd, dtBuf, sizeof(dtBuf));
+            if (dtEnd.has_time) {
+                fprintf(f, "DTEND:%s\r\n", dtBuf);
+            } else {
+                fprintf(f, "DTEND;VALUE=DATE:%s\r\n", dtBuf);
+            }
         } else {
-            fprintf(f, "DTEND;VALUE=DATE:%s\r\n", dtBuf);
+            /* Write DURATION instead of DTEND */
+            int durMins = ParseDurationMinutes(durStr);
+            if (durMins > 0) {
+                if (durMins >= 1440 && durMins % 1440 == 0)
+                    fprintf(f, "DURATION:P%dD\r\n", durMins / 1440);
+                else if (durMins >= 60 && durMins % 60 == 0)
+                    fprintf(f, "DURATION:PT%dH\r\n", durMins / 60);
+                else
+                    fprintf(f, "DURATION:PT%dM\r\n", durMins);
+            }
         }
     }
 
@@ -1020,6 +1091,7 @@ static bool IcsWriteEvent(FILE* f, CsvRow* row, AppState* state, int eventIndex)
         { ICS_STATUS,      "STATUS" },
         { ICS_TRANSP,      "TRANSP" },
         { ICS_PRIORITY,    "PRIORITY" },
+        { ICS_CLASS,       "CLASS" },
     };
 
     for (int i = 0; i < (int)(sizeof(textProps) / sizeof(textProps[0])); i++) {
@@ -1029,12 +1101,139 @@ static bool IcsWriteEvent(FILE* f, CsvRow* row, AppState* state, int eventIndex)
         }
     }
 
-    /* Recurrence (RRULE) */
-    const wchar_t* recurStr = GetField(row, mapping, ICS_RECURRENCE);
-    if (recurStr) {
-        const char* rrule = ParseRecurrence(recurStr);
-        if (rrule) {
-            fprintf(f, "RRULE:%s\r\n", rrule);
+    /* X-MICROSOFT-CDO-BUSYSTATUS for Outlook compatibility */
+    {
+        const wchar_t* transpVal = GetField(row, mapping, ICS_TRANSP);
+        if (transpVal && *transpVal) {
+            wchar_t lower[64];
+            int tlen = (int)wcslen(transpVal);
+            for (int i = 0; i < tlen && i < 63; i++) lower[i] = towlower(transpVal[i]);
+            lower[tlen < 63 ? tlen : 63] = L'\0';
+            if (wcsstr(lower, L"transparent") || wcsstr(lower, L"free"))
+                fprintf(f, "X-MICROSOFT-CDO-BUSYSTATUS:FREE\r\n");
+            else if (wcsstr(lower, L"opaque") || wcsstr(lower, L"busy"))
+                fprintf(f, "X-MICROSOFT-CDO-BUSYSTATUS:BUSY\r\n");
+            else if (wcsstr(lower, L"tentative"))
+                fprintf(f, "X-MICROSOFT-CDO-BUSYSTATUS:TENTATIVE\r\n");
+            else if (wcsstr(lower, L"oof") || wcsstr(lower, L"out"))
+                fprintf(f, "X-MICROSOFT-CDO-BUSYSTATUS:OOF\r\n");
+        }
+    }
+
+    /* Organizer */
+    {
+        const wchar_t* orgStr = GetField(row, mapping, ICS_ORGANIZER);
+        if (orgStr && *orgStr) {
+            char* utf8 = WideToUtf8(orgStr);
+            if (utf8) {
+                char line[MAX_FIELD_LEN];
+                if (wcschr(orgStr, L'@'))
+                    snprintf(line, sizeof(line), "ORGANIZER;CN=%s:mailto:%s", utf8, utf8);
+                else
+                    snprintf(line, sizeof(line), "ORGANIZER;CN=%s:mailto:noreply", utf8);
+                IcsWriteFolded(f, line);
+                free(utf8);
+            }
+        }
+    }
+
+    /* Required Attendees (semicolon or comma separated emails) */
+    {
+        const wchar_t* attStr = GetField(row, mapping, ICS_REQ_ATTENDEES);
+        if (attStr && *attStr) {
+            wchar_t buf[MAX_FIELD_LEN];
+            wcsncpy(buf, attStr, MAX_FIELD_LEN - 1);
+            buf[MAX_FIELD_LEN - 1] = L'\0';
+            wchar_t* ctx = NULL;
+            wchar_t* tok = wcstok(buf, L";,", &ctx);
+            while (tok) {
+                while (*tok == L' ') tok++;
+                if (*tok) {
+                    char* utf8 = WideToUtf8(tok);
+                    if (utf8) {
+                        char line[MAX_FIELD_LEN];
+                        snprintf(line, sizeof(line),
+                            "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;CN=%s:mailto:%s", utf8, utf8);
+                        IcsWriteFolded(f, line);
+                        free(utf8);
+                    }
+                }
+                tok = wcstok(NULL, L";,", &ctx);
+            }
+        }
+    }
+
+    /* Optional Attendees */
+    {
+        const wchar_t* attStr = GetField(row, mapping, ICS_OPT_ATTENDEES);
+        if (attStr && *attStr) {
+            wchar_t buf[MAX_FIELD_LEN];
+            wcsncpy(buf, attStr, MAX_FIELD_LEN - 1);
+            buf[MAX_FIELD_LEN - 1] = L'\0';
+            wchar_t* ctx = NULL;
+            wchar_t* tok = wcstok(buf, L";,", &ctx);
+            while (tok) {
+                while (*tok == L' ') tok++;
+                if (*tok) {
+                    char* utf8 = WideToUtf8(tok);
+                    if (utf8) {
+                        char line[MAX_FIELD_LEN];
+                        snprintf(line, sizeof(line),
+                            "ATTENDEE;ROLE=OPT-PARTICIPANT;PARTSTAT=NEEDS-ACTION;CN=%s:mailto:%s", utf8, utf8);
+                        IcsWriteFolded(f, line);
+                        free(utf8);
+                    }
+                }
+                tok = wcstok(NULL, L";,", &ctx);
+            }
+        }
+    }
+
+    /* Recurrence (RRULE) with optional interval, count, until */
+    {
+        const wchar_t* recurStr = GetField(row, mapping, ICS_RECURRENCE);
+        if (recurStr) {
+            const char* freq = ParseRecurrenceFreq(recurStr);
+            if (freq) {
+                char rrule[512];
+                snprintf(rrule, sizeof(rrule), "RRULE:%s", freq);
+
+                /* Interval override (only if base RRULE doesn't already contain INTERVAL) */
+                const wchar_t* intStr = GetField(row, mapping, ICS_RECUR_INTERVAL);
+                if (intStr && *intStr && !strstr(freq, "INTERVAL=")) {
+                    int intVal = _wtoi(intStr);
+                    if (intVal > 1) {
+                        char tmp[64];
+                        snprintf(tmp, sizeof(tmp), ";INTERVAL=%d", intVal);
+                        strcat(rrule, tmp);
+                    }
+                }
+
+                /* Count */
+                const wchar_t* cntStr = GetField(row, mapping, ICS_RECUR_COUNT);
+                if (cntStr && *cntStr) {
+                    int cntVal = _wtoi(cntStr);
+                    if (cntVal > 0) {
+                        char tmp[64];
+                        snprintf(tmp, sizeof(tmp), ";COUNT=%d", cntVal);
+                        strcat(rrule, tmp);
+                    }
+                }
+
+                /* Until date (takes precedence conceptually but RFC says don't use both COUNT and UNTIL) */
+                const wchar_t* untilStr = GetField(row, mapping, ICS_RECUR_END);
+                if (untilStr && *untilStr && !strstr(rrule, "COUNT=")) {
+                    ParsedDateTime untilDt = ParseDateTime(untilStr, datePref);
+                    if (untilDt.valid) {
+                        char tmp[64];
+                        snprintf(tmp, sizeof(tmp), ";UNTIL=%04d%02d%02d",
+                                 untilDt.year, untilDt.month, untilDt.day);
+                        strcat(rrule, tmp);
+                    }
+                }
+
+                IcsWriteFolded(f, rrule);
+            }
         }
     }
 
@@ -1252,22 +1451,22 @@ static void CreatePage2Controls(AppState* state, HWND parent) {
     state->hwndLblMapTitle = CreateLabel(parent, L"Step 2: Map CSV Columns to ICS Fields", 20, y, 500, 25, 0, titleFont);
     y += 35;
 
-    /* Use two-column layout: left side for core fields, right side for extra fields */
-    int labelX = 20, comboX = 170, rowH = 28;
-    int labelX2 = 440, comboX2 = 570;
+    /* Two-column layout for field mapping */
+    int labelX = 20, comboX = 170, rowH = 26;
+    int labelX2 = 430, comboX2 = 560;
 
-    /* Left column: core fields (0-9) */
-    for (int i = 0; i <= ICS_PRIORITY; i++) {
+    /* Left column: core fields (Start Date through Recurrence, indices 0-14) */
+    for (int i = 0; i <= ICS_RECURRENCE; i++) {
         state->hwndComboLabel[i] = CreateLabel(parent, ICS_FIELD_NAMES[i], labelX, y + 3, 145, 20, 0, font);
         state->hwndCombo[i] = CreateCombo(parent, comboX, y, 240, 200, COMBO_IDS[i], font);
         y += rowH;
     }
 
-    /* Right column: new fields (Start Time, End Time, All Day, Reminder, Recurrence) */
+    /* Right column: extended fields (Recur End Date through Duration) */
     int ry = 55; /* align with first combo row */
-    for (int i = ICS_START_TIME; i < ICS_FIELD_COUNT; i++) {
+    for (int i = ICS_RECUR_END; i < ICS_FIELD_COUNT; i++) {
         state->hwndComboLabel[i] = CreateLabel(parent, ICS_FIELD_NAMES[i], labelX2, ry + 3, 125, 20, 0, font);
-        state->hwndCombo[i] = CreateCombo(parent, comboX2, ry, 230, 200, COMBO_IDS[i], font);
+        state->hwndCombo[i] = CreateCombo(parent, comboX2, ry, 240, 200, COMBO_IDS[i], font);
         ry += rowH;
     }
 
@@ -1512,21 +1711,29 @@ static void AutoMapFields(AppState* state) {
 
     /* Try to auto-map based on header names */
     struct { int field; const wchar_t* keywords[8]; } autoMap[] = {
-        { ICS_DTSTART,     { L"start", L"dtstart", L"begin", L"date", L"start date", L"start_date", NULL } },
-        { ICS_DTEND,       { L"end", L"dtend", L"end date", L"end_date", L"finish", NULL } },
-        { ICS_SUMMARY,     { L"summary", L"title", L"subject", L"name", L"event", NULL } },
-        { ICS_DESCRIPTION, { L"description", L"desc", L"details", L"notes", L"body", NULL } },
-        { ICS_LOCATION,    { L"location", L"place", L"venue", L"where", L"address", NULL } },
-        { ICS_URL,         { L"url", L"link", L"website", NULL } },
-        { ICS_CATEGORIES,  { L"categories", L"category", L"tags", L"type", NULL } },
-        { ICS_STATUS,      { L"status", NULL } },
-        { ICS_TRANSP,      { L"transp", L"transparency", L"show as", NULL } },
-        { ICS_PRIORITY,    { L"priority", L"importance", NULL } },
-        { ICS_START_TIME,  { L"start time", L"start_time", L"time", L"begins", NULL } },
-        { ICS_END_TIME,    { L"end time", L"end_time", L"finish time", NULL } },
-        { ICS_ALL_DAY,     { L"all day", L"all_day", L"allday", L"whole day", NULL } },
-        { ICS_REMINDER,    { L"reminder", L"alarm", L"alert", NULL } },
-        { ICS_RECURRENCE,  { L"recurrence", L"recurring", L"repeat", L"frequency", L"rrule", NULL } },
+        { ICS_DTSTART,        { L"start", L"dtstart", L"begin", L"date", L"start date", L"start_date", NULL } },
+        { ICS_DTEND,          { L"end", L"dtend", L"end date", L"end_date", L"finish", NULL } },
+        { ICS_SUMMARY,        { L"summary", L"title", L"subject", L"name", L"event", NULL } },
+        { ICS_DESCRIPTION,    { L"description", L"desc", L"details", L"notes", L"body", NULL } },
+        { ICS_LOCATION,       { L"location", L"place", L"venue", L"where", L"address", NULL } },
+        { ICS_URL,            { L"url", L"link", L"website", NULL } },
+        { ICS_CATEGORIES,     { L"categories", L"category", L"tags", L"type", NULL } },
+        { ICS_STATUS,         { L"status", NULL } },
+        { ICS_TRANSP,         { L"transp", L"transparency", L"show as", NULL } },
+        { ICS_PRIORITY,       { L"priority", L"importance", NULL } },
+        { ICS_START_TIME,     { L"start time", L"start_time", L"time", L"begins", NULL } },
+        { ICS_END_TIME,       { L"end time", L"end_time", L"finish time", NULL } },
+        { ICS_ALL_DAY,        { L"all day", L"all_day", L"allday", L"whole day", NULL } },
+        { ICS_REMINDER,       { L"reminder", L"alarm", L"alert", NULL } },
+        { ICS_RECURRENCE,     { L"recurrence", L"recurring", L"repeat", L"frequency", L"rrule", NULL } },
+        { ICS_RECUR_END,      { L"recurrence end", L"recur end", L"repeat until", L"until", NULL } },
+        { ICS_RECUR_COUNT,    { L"recurrence count", L"recur count", L"occurrences", L"count", NULL } },
+        { ICS_RECUR_INTERVAL, { L"recurrence interval", L"recur interval", L"interval", NULL } },
+        { ICS_CLASS,          { L"classification", L"class", L"visibility", L"private", NULL } },
+        { ICS_ORGANIZER,      { L"organizer", L"organiser", L"host", NULL } },
+        { ICS_REQ_ATTENDEES,  { L"required attendees", L"attendees", L"req attendees", L"invitees", NULL } },
+        { ICS_OPT_ATTENDEES,  { L"optional attendees", L"opt attendees", NULL } },
+        { ICS_DURATION,       { L"duration", L"length", NULL } },
     };
 
     for (int m = 0; m < (int)(sizeof(autoMap) / sizeof(autoMap[0])); m++) {
@@ -1632,6 +1839,7 @@ static void UpdateIcsPreview(AppState* state) {
         { ICS_LOCATION, L"LOCATION" }, { ICS_URL, L"URL" },
         { ICS_CATEGORIES, L"CATEGORIES" }, { ICS_STATUS, L"STATUS" },
         { ICS_TRANSP, L"TRANSP" }, { ICS_PRIORITY, L"PRIORITY" },
+        { ICS_CLASS, L"CLASS" },
     };
 
     for (int i = 0; i < (int)(sizeof(fields) / sizeof(fields[0])); i++) {
@@ -1646,14 +1854,56 @@ static void UpdateIcsPreview(AppState* state) {
         }
     }
 
+    /* Organizer */
+    {
+        const wchar_t* orgStr = GetField(row, mapping, ICS_ORGANIZER);
+        if (orgStr && *orgStr) {
+            wchar_t line[512];
+            swprintf(line, 512, L"ORGANIZER:%s\r\n", orgStr);
+            if (wcslen(preview) + wcslen(line) < 3800) wcscat(preview, line);
+        }
+    }
+
+    /* Attendees */
+    {
+        const wchar_t* reqStr = GetField(row, mapping, ICS_REQ_ATTENDEES);
+        if (reqStr && *reqStr) {
+            wchar_t line[512];
+            swprintf(line, 512, L"ATTENDEE(REQ):%s\r\n", reqStr);
+            if (wcslen(preview) + wcslen(line) < 3800) wcscat(preview, line);
+        }
+        const wchar_t* optStr = GetField(row, mapping, ICS_OPT_ATTENDEES);
+        if (optStr && *optStr) {
+            wchar_t line[512];
+            swprintf(line, 512, L"ATTENDEE(OPT):%s\r\n", optStr);
+            if (wcslen(preview) + wcslen(line) < 3800) wcscat(preview, line);
+        }
+    }
+
+    /* Duration */
+    {
+        const wchar_t* durStr = GetField(row, mapping, ICS_DURATION);
+        if (durStr && *durStr) {
+            int mins = ParseDurationMinutes(durStr);
+            if (mins > 0) {
+                wchar_t line[128];
+                if (mins >= 60 && mins % 60 == 0)
+                    swprintf(line, 128, L"DURATION:PT%dH\r\n", mins / 60);
+                else
+                    swprintf(line, 128, L"DURATION:PT%dM\r\n", mins);
+                if (wcslen(preview) + wcslen(line) < 3800) wcscat(preview, line);
+            }
+        }
+    }
+
     /* Recurrence */
     const wchar_t* recurStr = GetField(row, mapping, ICS_RECURRENCE);
     if (recurStr) {
-        const char* rrule = ParseRecurrence(recurStr);
-        if (rrule) {
+        const char* freq = ParseRecurrenceFreq(recurStr);
+        if (freq) {
             wchar_t line[256];
-            swprintf(line, 256, L"RRULE:%hs\r\n", rrule);
-            wcscat(preview, line);
+            swprintf(line, 256, L"RRULE:%hs\r\n", freq);
+            if (wcslen(preview) + wcslen(line) < 3800) wcscat(preview, line);
         }
     }
 
@@ -1664,7 +1914,7 @@ static void UpdateIcsPreview(AppState* state) {
         if (mins >= 0) {
             wchar_t line[128];
             swprintf(line, 128, L"BEGIN:VALARM ... TRIGGER:-PT%dM\r\n", mins);
-            wcscat(preview, line);
+            if (wcslen(preview) + wcslen(line) < 3800) wcscat(preview, line);
         }
     }
 
@@ -1678,7 +1928,7 @@ static void DoOpenFile(AppState* state) {
     OPENFILENAME ofn = {0};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = state->hwndMain;
-    ofn.lpstrFilter = L"CSV Files (*.csv)\0*.csv\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"CSV/TSV Files (*.csv;*.tsv;*.txt)\0*.csv;*.tsv;*.txt\0CSV Files (*.csv)\0*.csv\0TSV Files (*.tsv;*.txt)\0*.tsv;*.txt\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = filePath;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
@@ -1823,19 +2073,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_SYSCOMMAND:
         if (wParam == IDM_ABOUT) {
             MessageBox(hwnd,
-                L"CSV to ICS Converter v1.0\r\n\r\n"
+                L"CSV to ICS Converter v1.1\r\n\r\n"
                 L"Author: Simon Craig\r\n"
                 L"Code: Entirely generated by Claude (Anthropic)\r\n\r\n"
-                L"Converts CSV files to RFC 5545 compliant\r\n"
+                L"Converts CSV/TSV files to RFC 5545 compliant\r\n"
                 L"iCalendar (.ics) files.\r\n\r\n"
                 L"Features:\r\n"
-                L"  \x2022  Auto-detects CSV headers\r\n"
+                L"  \x2022  CSV and TSV (tab-delimited) support\r\n"
+                L"  \x2022  Auto-detects headers and delimiter\r\n"
                 L"  \x2022  Flexible date/time parsing\r\n"
-                L"  \x2022  Field mapping with preview\r\n"
-                L"  \x2022  Single or per-event export\r\n"
+                L"  \x2022  Field mapping with live preview\r\n"
+                L"  \x2022  Attendees and Organizer\r\n"
+                L"  \x2022  Duration, Classification, Recurrence\r\n"
                 L"  \x2022  Reminders (VALARM)\r\n"
-                L"  \x2022  Recurrence rules\r\n"
-                L"  \x2022  Apple Calendar support\r\n\r\n"
+                L"  \x2022  Outlook and Apple Calendar support\r\n\r\n"
                 L"No external dependencies. Single executable\r\n"
                 L"built with the Windows SDK and pure C.",
                 L"About CSV to ICS Converter",
